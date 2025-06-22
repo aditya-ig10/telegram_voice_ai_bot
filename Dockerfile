@@ -1,9 +1,11 @@
-# Use a more complete base image
+# Use full Debian base for all FFmpeg and build tools
 FROM python:3.11-bullseye
 
-# Install system dependencies including FFmpeg and build tools
+# Install dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    pkg-config \
+    build-essential \
     libavformat-dev \
     libavcodec-dev \
     libavdevice-dev \
@@ -11,22 +13,24 @@ RUN apt-get update && apt-get install -y \
     libavfilter-dev \
     libswscale-dev \
     libswresample-dev \
-    pkg-config \
-    build-essential \
     && rm -rf /var/lib/apt/lists/*
+
+# Ensure pkg-config can find .pc files
+ENV PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and app code
+# Copy code
 COPY requirements.txt .
 COPY voice_bot.py .
 
 # Install Python dependencies
+RUN pip install --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Set Python to run unbuffered
+# Unbuffered logs
 ENV PYTHONUNBUFFERED=1
 
-# Run the app
+# Start the bot
 CMD ["python", "voice_bot.py"]
