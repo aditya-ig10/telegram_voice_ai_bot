@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Virtual environments
+venv/
+.env/
+
+# OS-specific
+.DS_Store
+
+# VSCode
+.vscode/
+
+# Generated audio/images
+*.ogg
+*.mp3
+*.wav
+generated_image.png
+voice.wav
+voice.ogg
+rep
