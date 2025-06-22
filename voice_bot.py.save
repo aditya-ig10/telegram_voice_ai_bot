@@ -1,0 +1,255 @@
+# telegram_voice_bot.py (Admin Controls + Enhanced Response + More Friendly Voice Bot)
+
+import os
+import json
+import asyncio
+import google.generativeai as genai
+import requests
+from PIL import Image, ImageDraw, ImageFont
+from faster_whisper import WhisperModel
+from pydub import AudioSegment
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    MessageHandler,
+    CommandHandler,
+    filters,
+)
+
+# === API KEYS ===
+TELEGRAM_TOKEN = "7725833933:AAF9ugrXxEObgf-XOYWnHdA7hQ1sN07ibTM"
+GEMINI_API_KEY = "AIzaSyDyCUnQumkU9-_mGegPo-bGgp6AeMO2gic"
+ELEVENLABS_API_KEY = "sk_15e53afe3c0d6b3ffb6bcb0a7e5278e7db5358737b4fea72"
+
+# === Configure Gemini ===
+genai.configure(api_key=GEMINI_API_KEY)
+text_model = genai.GenerativeModel("models/gemini-1.5-flash") 
+vision_model = genai.GenerativeModel("models/gemini-1.5-flash")
+
+# === Persistent Memory ===
+MEMORY_DIR = "memory"
+os.makedirs(MEMORY_DIR, exist_ok=True)
+
+user_lang_prefs = {}  # chat_id -> "en" or "hinglish"
+user_ids = set()
+admin_password = "ChoclateCupcake"
+admin_authenticated = set()
+
+# === Admin Command Handler ===
+async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_ids.add(chat_id)
+    args = context.args
+
+    if chat_id in admin_authenticated:
+        message = "\n".join([
+            "✅ Admin Panel",
+            f"Total Users: {len(user_ids)}",
+            f"Language Preferences: {user_lang_prefs.get(chat_id, 'en')}",
+            f"Memory Saved: {'Yes' if os.path.exists(os.path.join(MEMORY_DIR, f'chat_{chat_id}.json')) else 'No'}",
+            "\nCommands:",
+            "/reset - Reset your memory",
+            "/switchlang - Toggle between English and Hinglish",
+            "/clearall - Clear memory for all users (admin only)"
+        ])
+        await update.message.reply_text(message)
+    elif args and args[0] == admin_password:
+        admin_authenticated.add(chat_id)
+        await update.message.reply_text("🔓 Admin access granted!")
+    else:
+        await update.message.reply_text("🚫 Access denied. Use /admin <password>")
+
+# === Clear All Memory (Admin Only) ===
+async def clear_all_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id in admin_authenticated:
+        for filename in os.listdir(MEMORY_DIR):
+            os.remove(os.path.join(MEMORY_DIR, filename))
+        await update.message.reply_text("🧹 All user memory has been cleared!")
+    else:
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
+
+# === Toggle Language ===
+async def switch_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    current = user_lang_prefs.get(chat_id, "en")
+    new_lang = "hinglish" if current == "en" else "en"
+    user_lang_prefs[chat_id] = new_lang
+    await update.message.reply_text(f"Language switched to {new_lang.title()} ✅")
+
+# === Load & Save Memory ===
+def load_user_history(chat_id):
+    path = os.path.join(MEMORY_DIR, f"chat_{chat_id}.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            print(f"[WARN] Corrupted memory for chat {chat_id}, resetting.")
+            return []
+    return []
+
+def save_user_history(chat_id, history):
+    path = os.path.join(MEMORY_DIR, f"chat_{chat_id}.json")
+    with open(path, "w") as f:
+        json.dump(history[-50:], f)
+
+# === Gemini Response ===
+def get_gemini_response(prompt, chat_id):
+    lang_pref = user_lang_prefs.get(chat_id, "en")
+    tone = "Be super friendly, chill, and helpful. Use emojis occasionally."
+    lang_instruction = "Respond in a mix of Hindi and English (Hinglish)." if lang_pref == "hinglish" else "Respond in casual English."
+    friendly_prompt = f"{tone} {lang_instruction} Here's what the user said: {prompt}"
+
+    history = load_user_history(chat_id)
+    try:
+        convo = text_model.start_chat(history=[{"role": "user", "parts": [msg]} if i % 2 == 0 else {"role": "model", "parts": [msg]} for i, msg in enumerate(history)])
+        response = convo.send_message(friendly_prompt)
+        new_history = history + [prompt, response.text.strip()]
+        save_user_history(chat_id, new_history)
+        return response.text.strip()
+    except Exception as e:
+        return f"Oops, something went wrong talking to Gemini: {str(e)}"
+
+# === Vision ===
+def get_vision_response(image_path, prompt="Describe this image"):
+    try:
+        file = genai.upload_file(image_path)
+        response = vision_model.generate_content(
+            contents=[{"parts": [prompt, {"file_data": {"file_uri": file.uri}}]}]
+        )
+        return response.text.strip()
+    except Exception as e:
+        return f"Hmm, couldn't process the image: {str(e)}"
+
+# === Image Generator ===
+def generate_placeholder_image(text):
+    image = Image.new("RGB", (512, 512), color=(255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    draw.text((20, 250), text, fill=(0, 0, 0), font=font)
+    image_path = "generated_image.png"
+    image.save(image_path)
+    return image_path
+
+# === ElevenLabs TTS ===
+def text_to_speech(text):
+    url = "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM/stream"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "text": text,
+        "model_id": "eleven_monolingual_v1",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75
+        }
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code == 200:
+            with open("reply.mp3", "wb") as f:
+                f.write(response.content)
+            audio = AudioSegment.from_mp3("reply.mp3")
+            audio.export("reply.ogg", format="ogg")
+            return "reply.ogg"
+    except Exception as e:
+        print("[TTS ERROR]", e)
+    return None
+
+# === Voice Handler ===
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_ids.add(chat_id)
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    voice = await update.message.voice.get_file()
+    file_path = await voice.download_to_drive("voice.ogg")
+
+    try:
+        audio = AudioSegment.from_file(file_path, format="ogg")
+        audio.export("voice.wav", format="wav")
+        model = WhisperModel("base", compute_type="int8", cpu_threads=2)
+        segments, _ = model.transcribe("voice.wav")
+        user_input = " ".join([s.text for s in segments])
+    except Exception as e:
+        await update.message.reply_text("Couldn't process your voice message. 🫠")
+        return
+
+    if any(w in user_input.lower() for w in ["talk in hinglish", "bol hinglish"]):
+        user_lang_prefs[chat_id] = "hinglish"
+        await update.message.reply_text("Okay! Hinglish mode ON! 🇮🇳")
+    elif any(w in user_input.lower() for w in ["talk in english", "back to english"]):
+        user_lang_prefs[chat_id] = "en"
+        await update.message.reply_text("Back to English! 🇬🇧")
+
+    force_voice = any(word in user_input.lower() for word in ["voice reply", "send a voice note", "reply in voice", "say it", "audio"])
+    await process_message(user_input, update, context, force_voice=force_voice)
+
+# === Text Handler ===
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_ids.add(chat_id)
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    user_input = update.message.text
+
+    if user_input.strip().lower() == "/reset":
+        save_user_history(chat_id, [])
+        await update.message.reply_text("Memory reset. Fresh start! 🧠✨")
+        return
+
+    force_voice = any(word in user_input.lower() for word in ["voice reply", "send a voice note", "reply in voice", "say it", "audio"])
+    await process_message(user_input, update, context, force_voice=force_voice)
+
+# === Photo Handler ===
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
+    photo = await update.message.photo[-1].get_file()
+    photo_path = await photo.download_to_drive("user_photo.jpg")
+    caption = update.message.caption or "Describe this image"
+    reply = get_vision_response("user_photo.jpg", caption)
+    if len(reply) > 3500:
+        reply = reply[:3500] + "... (truncated)"
+    await update.message.reply_text(reply)
+
+# === Shared Processor ===
+async def process_message(user_input, update, context, force_voice=False):
+    chat_id = update.effective_chat.id
+    print(f"[USER] {user_input}")
+    reply = get_gemini_response(user_input, chat_id)
+    print(f"[GEMINI] {reply}")
+
+    if reply.lower().startswith("generate image:"):
+        prompt = reply.split(":", 1)[1].strip()
+        image_path = generate_placeholder_image(prompt)
+        with open(image_path, "rb") as img_file:
+            await context.bot.send_photo(chat_id=chat_id, photo=img_file)
+        return
+
+    if force_voice:
+        reply_audio = text_to_speech(reply)
+        if reply_audio:
+            with open(reply_audio, "rb") as f:
+                await context.bot.send_voice(chat_id=chat_id, voice=f)
+        else:
+            await update.message.reply_text("Sorry, couldn't send voice right now.")
+    else:
+        if len(reply) > 3500:
+            reply = reply[:3500] + "... (truncated)"
+        await update.message.reply_text(reply)
+
+# === Main ===
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("admin", admin_handler))
+    app.add_handler(CommandHandler("clearall", clear_all_handler))
+    app.add_handler(CommandHandler("switchlang", switch_language))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    print("🤖 Gemini Voice Bot with ElevenLabs + Persistent Memory + Admin is running...")
+    app.run_polling()
+
